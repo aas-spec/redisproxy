@@ -4,11 +4,19 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/aas-spec/mlog"
 	"github.com/gomodule/redigo/redis"
 	"github.com/gorilla/websocket"
 )
 
 // type AuthFunc func(req *http.Request) bool
+type RedisConfig struct {
+	Host     string
+	Port     int
+	Password string
+	Db       int
+	Channel  string
+}
 
 type sockethub struct {
 	// registered connections
@@ -26,10 +34,12 @@ type sockethub struct {
 	// copy of the redis client
 	rclient *RedisClient
 
+	// Канал для подписки, к которому добавляется id  /channel/id
+	channel string
 	// copy of the redis connection
 	rconn redis.Conn
 
-	Auth func(req *http.Request) bool
+	Auth func(req *http.Request) string
 }
 
 var h = sockethub{
@@ -40,13 +50,13 @@ var h = sockethub{
 }
 
 func (h *sockethub) WsHandler(w http.ResponseWriter, r *http.Request) {
-	var authenticated bool
+	var authId string
 
 	if h.Auth != nil {
-		authenticated = h.Auth(r)
+		authId = h.Auth(r)
 	}
-
-	if authenticated {
+	// Проверяю, если не пустой id
+	if authId != "" {
 		ws, err := websocket.Upgrade(w, r, nil, 1024, 1024)
 
 		if _, ok := err.(websocket.HandshakeError); ok {
@@ -57,13 +67,14 @@ func (h *sockethub) WsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		c := &connection{send: make(chan *Data), ws: ws}
+		c := &connection{sid: authId, send: make(chan *Data), ws: ws}
 		h.register <- c
 
 		go c.writer()
 		go c.reader()
 	} else {
-		http.Error(w, "Invalid API key", 401)
+		mlog.Print("Invalid Query")
+		http.Error(w, "Invalid Query", 401)
 	}
 }
 
@@ -72,8 +83,12 @@ func (h *sockethub) Run() {
 		select {
 		case c := <-h.register:
 			h.connections[c] = true
+			h.rclient.Subscribe(h.channel + "/" + c.sid)
+			mlog.LPrintf(6, "Connected: %s", c.sid)
 		case c := <-h.unregister:
 			if _, ok := h.connections[c]; ok {
+				mlog.LPrintf(6, "Disconnected: %s", c.sid)
+				h.rclient.Unsubscribe("/queue/" + c.sid)
 				delete(h.connections, c)
 				close(c.send)
 			}
@@ -81,9 +96,7 @@ func (h *sockethub) Run() {
 			for c := range h.connections {
 				select {
 				case c.send <- m:
-					if DEBUG {
-						log.Printf("broadcasting: %s", m.Payload)
-					}
+					mlog.LPrintf(7, "broadcasting: %s", m.Payload)
 				default:
 					close(c.send)
 					delete(h.connections, c)
@@ -93,26 +106,27 @@ func (h *sockethub) Run() {
 	}
 }
 
-func (h *sockethub) RegisterAuthFunc(AuthFunc func(req *http.Request) bool) {
+func (h *sockethub) RegisterAuthFunc(AuthFunc func(req *http.Request) string) {
 	aut := AuthFunc
 	h.Auth = aut
 }
 
-func (h *sockethub) StartServer() {
-	conf := LoadConfig("config")
-	client, err := NewRedisClient(conf.Redis.Host)
+func (h *sockethub) StartServer(config RedisConfig, webHost string) {
+	//	conf := LoadConfig("config")
+	client, err := NewRedisClient(config)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	defer client.Close()
-
+	h.rclient = client
+	h.channel = config.Channel
 	go h.Run()
 
 	http.HandleFunc("/", h.WsHandler)
-	log.Println("Starting server on: ", conf.Web.Host)
+	mlog.Printf("Starting server on: %s", webHost)
 
-	err = http.ListenAndServe(conf.Web.Host, nil)
+	err = http.ListenAndServe(webHost, nil)
 	if err != nil {
 		log.Fatal(err)
 	}

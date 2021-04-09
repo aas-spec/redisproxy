@@ -1,12 +1,11 @@
 package goatee
 
 import (
-	"encoding/json"
 	"log"
 	"strconv"
 	"sync"
 	"time"
-
+	"github.com/aas-spec/mlog"
 	"github.com/gomodule/redigo/redis"
 )
 
@@ -32,19 +31,18 @@ type Client interface {
 	Receive() (message Message)
 }
 
-func NewRedisClient(host string) (*RedisClient, error) {
-	conn, err := redis.Dial("tcp", host)
+func NewRedisClient(config RedisConfig) (*RedisClient, error) {
+	curHost :=  config.Host + ":" + strconv.Itoa(config.Port)
+	conn, err := redis.Dial("tcp", curHost)
 	if err != nil {
 		log.Printf("Error dialing redis pubsub: %s", err)
 		return nil, err
 	}
 
-	pubsub, _ := redis.Dial("tcp", host)
+	pubsub, _ := redis.Dial("tcp", curHost)
 	client := RedisClient{conn, redis.PubSubConn{pubsub}, sync.Mutex{}}
 
-	if DEBUG {
-		log.Println("Subscribed to Redis on: ", host)
-	}
+	mlog.LLog(9, "Subscribed to Redis on: ", curHost)
 
 	go func() {
 		for {
@@ -78,13 +76,9 @@ func (client *RedisClient) PubsubHub() {
 	for {
 		message := client.Receive()
 		if message.Type == "message" {
-			err := json.Unmarshal(message.Data, &data)
-			if err != nil {
-				log.Println("Error parsing payload JSON: ", err)
-			}
-
+			mlog.LPrintf(5, "Receive data: %s %s", message.Channel, string(message.Data) )
 			data.Channel = message.Channel
-
+			data.Payload = string(message.Data);
 			h.broadcast <- &data
 			if DEBUG {
 				log.Printf("Received: %s", message)
